@@ -290,6 +290,7 @@ class RadioRunner:
         self.audio_buffer = deque()
 
         self.sdr = None
+        self.sdr_lock = threading.Lock()
         self.radio_thread = None
     def get_audio_source(self):
         return DiscordRadioSource(
@@ -339,17 +340,17 @@ class RadioRunner:
         Example: tune(101.1) -> 101.1 MHz
         """
         new_freq_hz = int(freq_mhz * 1_000_000)
-
+    
         if self.sdr is None:
             raise RuntimeError("SDR is not running yet.")
-
-        self.sdr.center_freq = new_freq_hz
-
+    
+        with self.sdr_lock:
+            self.sdr.center_freq = new_freq_hz
+    
         self.send_text_to_discord(
             f"Tuned to **{freq_mhz:.3f} MHz**"
         )
-
-
+    
     def radio_worker(self):
         try:
             self.send_text_to_discord(
@@ -508,11 +509,11 @@ async def tune(ctx, freq_mhz: float):
         return
 
     try:
-        radio_runner.tune(freq_mhz)
-        await ctx.send(f" Tuning to **{freq_mhz:.3f} MHz**...")
+        await asyncio.to_thread(radio_runner.tune, freq_mhz)
+        await ctx.send(f"Tuned to **{freq_mhz:.3f} MHz**.")
     except Exception as e:
         await ctx.send(f"Could not tune radio: `{e}`")
-
+    
 @bot.command()
 async def status(ctx):
     global radio_runner
