@@ -17,25 +17,20 @@ import discord.opus
 from discord.ext import commands
 from dotenv import load_dotenv
 
-# Load Opus for Discord voice on Linux/Raspberry Pi.
-try:
-    if not discord.opus.is_loaded():
-        discord.opus.load_opus("libopus.so.0")
-except Exception as e:
-    print(f"Warning: could not load opus: {e}")
-
 
 # ============================================================
 # USER SETTINGS
 # ============================================================
 
+# Default station: 90.1 MHz
 STATION_FREQ_HZ = 90_100_000
 TUNE_OFFSET_HZ = 0
 current_station_freq_hz = STATION_FREQ_HZ
 
-# Lower rates are easier on a Raspberry Pi and reduce choppy audio.
-RF_SAMPLE_RATE = 768_000
-IF_RATE = 192_000
+# Use a rate your RTL-SDR accepted before.
+# 768000 caused: "Could not set sample rate"
+RF_SAMPLE_RATE = 1_024_000
+IF_RATE = 256_000
 AUDIO_RATE = 48_000
 
 TUNER_GAIN = 25
@@ -44,14 +39,25 @@ FREQ_PPM = 0
 DEEMPH_TAU = 75e-6
 AUDIO_GAIN_DB = 6
 
-IQ_CHUNK_SAMPLES = 131_072
+IQ_CHUNK_SAMPLES = 262_144
 MAX_BUFFER_CHUNKS = 240
 TRIM_TO_CHUNKS = 120
-STARTUP_BUFFER_SEC = 2.5
 
 WFM_CHAN_CUTOFF_HZ_INIT = 100_000
 
 BOT_PREFIX = "!"
+
+
+# ============================================================
+# OPUS LOADING FOR DISCORD VOICE
+# ============================================================
+
+try:
+    if not discord.opus.is_loaded():
+        discord.opus.load_opus("libopus.so.0")
+except Exception as e:
+    print(f"Warning: could not load Opus automatically: {e}")
+    print("Install Opus with: sudo apt install -y libopus0 libopus-dev")
 
 
 # ============================================================
@@ -91,7 +97,7 @@ class Deemphasis:
 
 
 class AudioAGC:
-    def __init__(self, fs=AUDIO_RATE, target=0.18, attack_ms=25, release_ms=250):
+    def __init__(self, fs=AUDIO_RATE, target=0.16, attack_ms=25, release_ms=250):
         self.target = float(target)
         self.attack_a = math.exp(-1.0 / (fs * (attack_ms / 1000.0)))
         self.release_a = math.exp(-1.0 / (fs * (release_ms / 1000.0)))
@@ -114,14 +120,15 @@ class AudioAGC:
 
 
 # ============================================================
-# LIGHTWEIGHT MONO WFM DEMODULATOR
+# LIGHTER MONO WFM DEMODULATOR
 # ============================================================
 
 class WFMMonoDemod:
     """
-    Lightweight wideband FM mono demodulator.
-    It outputs stereo-shaped audio by copying mono audio to left and right.
-    This is much easier on a Raspberry Pi than full stereo FM decoding.
+    Lighter mono FM demodulator for Raspberry Pi.
+
+    This avoids stereo pilot/subcarrier decoding, which is much heavier
+    and can make Discord audio choppy on lower-power devices.
     """
 
     def __init__(self, chan_cutoff_hz: int):
@@ -134,8 +141,6 @@ class WFMMonoDemod:
         self.audio_state = np.zeros(len(self.audio_taps) - 1, dtype=np.float32)
 
         self.prev_iq = None
-        self.phase = 0.0
-        self.step = 2.0 * np.pi * (TUNE_OFFSET_HZ / RF_SAMPLE_RATE)
 
         self.up_if, self.down_if = rational_resample_ratio(RF_SAMPLE_RATE, IF_RATE)
         self.up_a, self.down_a = rational_resample_ratio(IF_RATE, AUDIO_RATE)
@@ -144,19 +149,8 @@ class WFMMonoDemod:
         self.agc = AudioAGC(fs=AUDIO_RATE)
         self.audio_gain = float(10 ** (AUDIO_GAIN_DB / 20.0))
 
-    def mix_offset_to_baseband(self, iq: np.ndarray) -> np.ndarray:
-        if TUNE_OFFSET_HZ == 0:
-            return iq.astype(np.complex64, copy=False)
-
-        n = np.arange(len(iq), dtype=np.float32)
-        ph = self.phase + self.step * n
-        osc = np.exp(1j * ph).astype(np.complex64)
-        self.phase = float((self.phase + self.step * len(iq)) % (2.0 * np.pi))
-
-        return iq.astype(np.complex64, copy=False) * osc
-
     def fm_discriminator(self, iq_if: np.ndarray) -> np.ndarray:
-        if iq_if.size == 0:
+        if len(iq_if) == 0:
             return np.zeros((0,), dtype=np.float32)
 
         if self.prev_iq is None:
@@ -169,7 +163,7 @@ class WFMMonoDemod:
         return np.angle(d).astype(np.float32)
 
     def process_block(self, iq: np.ndarray) -> np.ndarray:
-        iq = self.mix_offset_to_baseband(iq)
+        iq = iq.astype(np.complex64, copy=False)
 
         iq_f, self.chan_state = fir_filter(iq, self.chan_taps, self.chan_state)
         iq_if = resample_poly(iq_f, self.up_if, self.down_if).astype(np.complex64)
@@ -181,11 +175,13 @@ class WFMMonoDemod:
 
         audio = self.deemph.process(audio)
 
+        # Discord expects stereo PCM, so duplicate mono into left/right.
         stereo = np.column_stack([audio, audio]).astype(np.float32)
+
         stereo = self.agc.process(stereo)
         stereo *= self.audio_gain
 
-        peak = float(np.max(np.abs(stereo)) + 1e-9)
+        peak = float(np.max(np.abs(stereo)) + 1e-9) if stereo.size else 1e-9
         if peak > 0.98:
             stereo *= 0.98 / peak
 
@@ -198,7 +194,7 @@ class WFMMonoDemod:
 
 class DiscordRadioSource(discord.AudioSource):
     """
-    Discord expects 20 ms chunks of 48 kHz stereo signed 16-bit PCM.
+    Discord expects 20ms chunks of 48kHz stereo signed 16-bit PCM.
 
     48,000 Hz * 0.020 sec = 960 frames
     960 frames * 2 channels * 2 bytes = 3840 bytes
@@ -208,6 +204,7 @@ class DiscordRadioSource(discord.AudioSource):
         self.audio_buffer = audio_buffer
         self.buf_lock = buf_lock
         self.stop_event = stop_event
+
         self.leftover = np.zeros((0, 2), dtype=np.float32)
         self.frames_per_read = 960
         self.last_low_buffer_print = 0.0
@@ -250,6 +247,7 @@ class DiscordRadioSource(discord.AudioSource):
 
         out = np.clip(out, -1.0, 1.0)
         pcm16 = (out * 32767.0).astype(np.int16)
+
         return pcm16.tobytes()
 
     def is_opus(self):
@@ -264,11 +262,16 @@ class RadioRunner:
     def __init__(self, text_channel, bot_loop):
         self.text_channel = text_channel
         self.bot_loop = bot_loop
+
         self.stop_event = threading.Event()
+
         self.buf_lock = threading.Lock()
         self.audio_buffer = deque()
+
         self.sdr = None
         self.radio_thread = None
+
+        self.last_peak_print = 0.0
 
     def get_audio_source(self):
         return DiscordRadioSource(
@@ -279,6 +282,7 @@ class RadioRunner:
 
     def start(self):
         self.stop_event.clear()
+
         self.radio_thread = threading.Thread(
             target=self.radio_worker,
             daemon=True,
@@ -302,6 +306,7 @@ class RadioRunner:
                 pass
 
             time.sleep(1.0)
+
             self.sdr = None
 
         with self.buf_lock:
@@ -311,13 +316,18 @@ class RadioRunner:
         async def send_msg():
             await self.text_channel.send(f"📻 **Radio:** {text}")
 
-        asyncio.run_coroutine_threadsafe(send_msg(), self.bot_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(send_msg(), self.bot_loop)
+        except Exception as e:
+            print(f"Could not send Discord message: {e}")
 
-    def buffer_size(self):
+    def buffer_count(self):
         with self.buf_lock:
             return len(self.audio_buffer)
 
     def radio_worker(self):
+        global current_station_freq_hz
+
         try:
             self.send_text_to_discord(
                 f"Tuning to `{current_station_freq_hz / 1_000_000:.3f} MHz`..."
@@ -338,17 +348,20 @@ class RadioRunner:
                         f"Warning: could not set PPM correction: `{e}`"
                     )
 
-            print(
-                f"RTL-SDR started at {current_station_freq_hz / 1_000_000:.3f} MHz, "
-                f"sample_rate={RF_SAMPLE_RATE}, gain={TUNER_GAIN}"
-            )
-
             def rtl_callback(iq, _ctx):
                 if self.stop_event.is_set():
                     return
 
                 try:
                     stereo = demod.process_block(iq)
+
+                    now = time.time()
+                    if now - self.last_peak_print > 5.0:
+                        peak = float(np.max(np.abs(stereo))) if stereo.size else 0.0
+                        with self.buf_lock:
+                            blen = len(self.audio_buffer)
+                        print(f"audio peak: {peak:.4f}, buffer chunks: {blen}")
+                        self.last_peak_print = now
 
                     with self.buf_lock:
                         self.audio_buffer.append(stereo)
@@ -358,7 +371,7 @@ class RadioRunner:
                                 self.audio_buffer.popleft()
 
                 except Exception as e:
-                    print(f"DSP callback error: {e}")
+                    print(f"radio callback error: {e}")
 
             self.sdr.read_samples_async(rtl_callback, IQ_CHUNK_SAMPLES)
 
@@ -409,7 +422,7 @@ async def join(ctx):
 
 @bot.command()
 async def radio(ctx):
-    global radio_runner, current_station_freq_hz
+    global radio_runner
 
     if ctx.author.voice is None:
         await ctx.send("Join a voice channel first.")
@@ -423,30 +436,22 @@ async def radio(ctx):
         return
 
     radio_runner = RadioRunner(ctx.channel, bot.loop)
+
+    # Start SDR first so the buffer has time to fill.
     radio_runner.start()
 
-    await ctx.send(
-        f"Started SDR at **{current_station_freq_hz / 1_000_000:.3f} MHz**. Buffering audio..."
-    )
-
-    await asyncio.sleep(STARTUP_BUFFER_SEC)
-
-    if radio_runner is None:
-        return
+    await ctx.send("Buffering radio audio...")
+    await asyncio.sleep(2.5)
 
     source = radio_runner.get_audio_source()
 
-    try:
-        ctx.voice_client.play(
-            source,
-            after=lambda e: print(f"Discord voice playback error: {e}") if e else None,
-        )
-    except Exception as e:
-        await ctx.send(f"Could not start Discord audio: `{e}`")
-        return
+    ctx.voice_client.play(
+        source,
+        after=lambda e: print(f"Discord voice playback error: {e}") if e else None,
+    )
 
     await ctx.send(
-        f"Playing radio at **{current_station_freq_hz / 1_000_000:.3f} MHz**."
+        f"Started radio at **{current_station_freq_hz / 1_000_000:.3f} MHz**."
     )
 
 
@@ -454,12 +459,12 @@ async def radio(ctx):
 async def stopradio(ctx):
     global radio_runner
 
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-
     if radio_runner is not None:
         radio_runner.stop()
         radio_runner = None
+
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
 
     await ctx.send("Stopped radio.")
 
@@ -467,9 +472,6 @@ async def stopradio(ctx):
 @bot.command()
 async def leave(ctx):
     global radio_runner
-
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
 
     if radio_runner is not None:
         radio_runner.stop()
@@ -484,6 +486,11 @@ async def leave(ctx):
 
 @bot.command()
 async def tune(ctx, freq_mhz: float):
+    """
+    Safer retune:
+    stop Discord playback, close RTL-SDR, wait, reopen at new frequency.
+    This avoids live retuning errors like i2c failed=-6 / LIBUSB busy.
+    """
     global radio_runner, current_station_freq_hz
 
     if freq_mhz < 50 or freq_mhz > 110:
@@ -491,13 +498,6 @@ async def tune(ctx, freq_mhz: float):
         return
 
     current_station_freq_hz = int(freq_mhz * 1_000_000)
-
-    if ctx.author.voice is None:
-        await ctx.send("Join a voice channel first.")
-        return
-
-    if ctx.voice_client is None:
-        await ctx.author.voice.channel.connect()
 
     was_running = radio_runner is not None
 
@@ -507,37 +507,38 @@ async def tune(ctx, freq_mhz: float):
         )
         return
 
-    await ctx.send(f"Retuning to **{freq_mhz:.3f} MHz**...")
-
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-
-    radio_runner.stop()
-    radio_runner = None
-
-    await asyncio.sleep(2.0)
-
-    radio_runner = RadioRunner(ctx.channel, bot.loop)
-    radio_runner.start()
-
-    await ctx.send("Buffering after retune...")
-    await asyncio.sleep(STARTUP_BUFFER_SEC)
-
-    if radio_runner is None:
+    if ctx.voice_client is None:
+        await ctx.send("I am not connected to voice.")
         return
 
-    source = radio_runner.get_audio_source()
+    await ctx.send(f"Retuning to **{freq_mhz:.3f} MHz**...")
 
     try:
+        if ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+
+        radio_runner.stop()
+        radio_runner = None
+
+        await asyncio.sleep(2.0)
+
+        radio_runner = RadioRunner(ctx.channel, bot.loop)
+        radio_runner.start()
+
+        await ctx.send("Buffering radio audio...")
+        await asyncio.sleep(2.5)
+
+        source = radio_runner.get_audio_source()
+
         ctx.voice_client.play(
             source,
             after=lambda e: print(f"Discord voice playback error: {e}") if e else None,
         )
-    except Exception as e:
-        await ctx.send(f"Could not restart Discord audio: `{e}`")
-        return
 
-    await ctx.send(f"Retuned to **{freq_mhz:.3f} MHz**.")
+        await ctx.send(f"Retuned to **{freq_mhz:.3f} MHz**.")
+
+    except Exception as e:
+        await ctx.send(f"Could not tune radio: `{e}`")
 
 
 @bot.command()
@@ -558,7 +559,7 @@ async def status(ctx):
         f"Radio running: `{radio_runner is not None}`\n"
         f"Voice connected: `{vc.is_connected()}`\n"
         f"Voice playing: `{vc.is_playing()}`\n"
-        f"Audio buffer chunks: `{radio_runner.buffer_size()}`"
+        f"Audio buffer chunks: `{radio_runner.buffer_count()}`"
     )
 
 
@@ -568,15 +569,14 @@ async def shutdown(ctx):
 
     await ctx.send("Shutting down radio bot...")
 
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-
     if radio_runner is not None:
         radio_runner.stop()
         radio_runner = None
 
     if ctx.voice_client:
         try:
+            if ctx.voice_client.is_playing():
+                ctx.voice_client.stop()
             await ctx.voice_client.disconnect()
         except Exception:
             pass
@@ -594,5 +594,6 @@ def shutdown_handler(*_args):
 
 signal.signal(signal.SIGINT, shutdown_handler)
 signal.signal(signal.SIGTERM, shutdown_handler)
+
 
 bot.run(TOKEN)
