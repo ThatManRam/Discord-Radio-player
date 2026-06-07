@@ -13,15 +13,23 @@ from scipy.signal import firwin, lfilter, resample_poly
 from rtlsdr import RtlSdr
 
 import discord
+import discord.opus
 from discord.ext import commands
 from dotenv import load_dotenv
+
+# Load Opus for Discord voice on Linux/Raspberry Pi.
+try:
+    if not discord.opus.is_loaded():
+        discord.opus.load_opus("libopus.so.0")
+except Exception as e:
+    print(f"Warning: could not load opus: {e}")
 
 
 # ============================================================
 # USER SETTINGS
 # ============================================================
 
-STATION_FREQ_HZ = 90_098_000
+STATION_FREQ_HZ = 90_100_000
 TUNE_OFFSET_HZ = 0
 current_station_freq_hz = STATION_FREQ_HZ
 
@@ -33,7 +41,7 @@ TUNER_GAIN = 25
 FREQ_PPM = 0
 
 DEEMPH_TAU = 75e-6
-AUDIO_GAIN_DB = -12.3
+AUDIO_GAIN_DB = 6
 
 IQ_CHUNK_SAMPLES = 262_144
 MAX_BUFFER_CHUNKS = 120
@@ -315,12 +323,18 @@ class RadioRunner:
                 self.sdr.cancel_read_async()
             except Exception:
                 pass
-    
+
+            # Give librtlsdr a moment to stop the async USB transfer.
+            time.sleep(0.5)
+
             try:
                 self.sdr.close()
             except Exception:
                 pass
-    
+
+            # Give the OS a moment to release the USB device.
+            time.sleep(1.0)
+
             self.sdr = None
     
         with self.buf_lock:
@@ -333,31 +347,13 @@ class RadioRunner:
         asyncio.run_coroutine_threadsafe(send_msg(), self.bot_loop)
 
 
-    def tune(self, freq_mhz: float):
-        """
-        Request a radio station change.
-        The SDR thread will apply it safely.
-        """
-        new_freq_hz = int(freq_mhz * 1_000_000)
-
-        if self.sdr is None:
-            raise RuntimeError("SDR is not running yet.")
-
-        with self.tune_lock:
-            self.pending_freq_hz = new_freq_hz
-            self.pending_freq_mhz = freq_mhz
-
-        self.send_text_to_discord(
-            f"Tune requested: **{freq_mhz:.3f} MHz**"
-        )
-
     def radio_worker(self):
         try:
             self.send_text_to_discord(
                 f"Tuning to `{current_station_freq_hz / 1_000_000:.3f} MHz`..."
             )
 
-            demod_box = [WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)]
+            demod = WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)
 
             self.sdr = RtlSdr()
             self.sdr.sample_rate = RF_SAMPLE_RATE
@@ -377,22 +373,7 @@ class RadioRunner:
                     return
 
                 try:
-                    with self.tune_lock:
-                        requested_freq_hz = self.pending_freq_hz
-                        requested_freq_mhz = self.pending_freq_mhz
-                        self.pending_freq_hz = None
-                        self.pending_freq_mhz = None
-
-                    if requested_freq_hz is not None:
-
-                        # Reset demodulator state after tuning
-                        demod_box[0] = WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)
-
-                        self.send_text_to_discord(
-                            f"Tuned to **{requested_freq_mhz:.3f} MHz**"
-                        )
-
-                    stereo = demod_box[0].process_block(iq)
+                    stereo = demod.process_block(iq)
 
                     with self.buf_lock:
                         self.audio_buffer.append(stereo)
@@ -453,7 +434,7 @@ async def join(ctx):
 
 @bot.command()
 async def radio(ctx):
-    global radio_runner
+    global radio_runner, current_station_freq_hz
 
     if ctx.author.voice is None:
         await ctx.send("Join a voice channel first.")
@@ -510,6 +491,7 @@ async def leave(ctx):
     else:
         await ctx.send("I am not in a voice channel.")
 
+
 @bot.command()
 async def tune(ctx, freq_mhz: float):
     global radio_runner, current_station_freq_hz
@@ -520,34 +502,47 @@ async def tune(ctx, freq_mhz: float):
 
     current_station_freq_hz = int(freq_mhz * 1_000_000)
 
+    if ctx.author.voice is None:
+        await ctx.send("Join a voice channel first.")
+        return
+
+    if ctx.voice_client is None:
+        await ctx.author.voice.channel.connect()
+
     was_running = radio_runner is not None
 
-    if was_running:
-        await ctx.send(f"Retuning to **{freq_mhz:.3f} MHz**...")
-
-        radio_runner.stop()
-        radio_runner = None
-
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-
-        await asyncio.sleep(1.0)
-
-        radio_runner = RadioRunner(ctx.channel, bot.loop)
-        source = radio_runner.get_audio_source()
-
-        ctx.voice_client.play(
-            source,
-            after=lambda e: print(f"Discord voice playback error: {e}") if e else None,
-        )
-
-        radio_runner.start()
-
-        await ctx.send(f"Retuned to **{freq_mhz:.3f} MHz**.")
-    else:
+    if not was_running:
         await ctx.send(
             f"Station set to **{freq_mhz:.3f} MHz**. Start it with `!radio`."
         )
+        return
+
+    await ctx.send(f"Retuning to **{freq_mhz:.3f} MHz**...")
+
+    # Stop Discord playback before closing the SDR.
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+
+    # Stop and close the RTL-SDR cleanly.
+    radio_runner.stop()
+    radio_runner = None
+
+    # Extra delay helps prevent LIBUSB_ERROR_BUSY when reopening the stick.
+    await asyncio.sleep(2.0)
+
+    # Reopen the SDR at the new frequency and start Discord playback again.
+    radio_runner = RadioRunner(ctx.channel, bot.loop)
+    source = radio_runner.get_audio_source()
+
+    ctx.voice_client.play(
+        source,
+        after=lambda e: print(f"Discord voice playback error: {e}") if e else None,
+    )
+
+    radio_runner.start()
+
+    await ctx.send(f"Retuned to **{freq_mhz:.3f} MHz**.")
+
 @bot.command()
 async def status(ctx):
     global radio_runner
