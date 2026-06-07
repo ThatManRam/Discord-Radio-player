@@ -290,7 +290,9 @@ class RadioRunner:
         self.audio_buffer = deque()
 
         self.sdr = None
-        self.sdr_lock = threading.Lock()
+        self.pending_freq_hz = None
+        self.pending_freq_mhz = None
+        self.tune_lock = threading.Lock()
         self.radio_thread = None
     def get_audio_source(self):
         return DiscordRadioSource(
@@ -336,28 +338,29 @@ class RadioRunner:
 
     def tune(self, freq_mhz: float):
         """
-        Change the radio station while the SDR is running.
-        Example: tune(101.1) -> 101.1 MHz
+        Request a radio station change.
+        The SDR thread will apply it safely.
         """
         new_freq_hz = int(freq_mhz * 1_000_000)
-    
+
         if self.sdr is None:
             raise RuntimeError("SDR is not running yet.")
-    
-        with self.sdr_lock:
-            self.sdr.center_freq = new_freq_hz
-    
+
+        with self.tune_lock:
+            self.pending_freq_hz = new_freq_hz
+            self.pending_freq_mhz = freq_mhz
+
         self.send_text_to_discord(
-            f"Tuned to **{freq_mhz:.3f} MHz**"
+            f"Tune requested: **{freq_mhz:.3f} MHz**"
         )
-    
+
     def radio_worker(self):
         try:
             self.send_text_to_discord(
                 f"Tuning to `{STATION_FREQ_HZ / 1_000_000:.3f} MHz`..."
             )
 
-            demod = WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)
+            demod_box = [WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)]
 
             self.sdr = RtlSdr()
             self.sdr.sample_rate = RF_SAMPLE_RATE
@@ -377,7 +380,23 @@ class RadioRunner:
                     return
 
                 try:
-                    stereo = demod.process_block(iq)
+                    with self.tune_lock:
+                        requested_freq_hz = self.pending_freq_hz
+                        requested_freq_mhz = self.pending_freq_mhz
+                        self.pending_freq_hz = None
+                        self.pending_freq_mhz = None
+
+                    if requested_freq_hz is not None:
+                        self.sdr.center_freq = requested_freq_hz
+
+                        # Reset demodulator state after tuning
+                        demod_box[0] = WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)
+
+                        self.send_text_to_discord(
+                            f"Tuned to **{requested_freq_mhz:.3f} MHz**"
+                        )
+
+                    stereo = demod_box[0].process_block(iq)
 
                     with self.buf_lock:
                         self.audio_buffer.append(stereo)
@@ -495,7 +514,6 @@ async def leave(ctx):
     else:
         await ctx.send("I am not in a voice channel.")
 
-
 @bot.command()
 async def tune(ctx, freq_mhz: float):
     global radio_runner
@@ -509,11 +527,11 @@ async def tune(ctx, freq_mhz: float):
         return
 
     try:
-        await asyncio.to_thread(radio_runner.tune, freq_mhz)
-        await ctx.send(f"Tuned to **{freq_mhz:.3f} MHz**.")
+        radio_runner.tune(freq_mhz)
+        await ctx.send(f"Tune request sent for **{freq_mhz:.3f} MHz**.")
     except Exception as e:
         await ctx.send(f"Could not tune radio: `{e}`")
-    
+        
 @bot.command()
 async def status(ctx):
     global radio_runner
