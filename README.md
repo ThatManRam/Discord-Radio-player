@@ -1,6 +1,6 @@
-# Discord-Scan-Bot
-this is a bot inspired by shodan that scans the internet for open ports on Ips, and saves them all on discord using the bot.
+# Discord Radio bot
 
+this is a Radio bot that just plays the radio :L
 
 you will need a .env file with:
 
