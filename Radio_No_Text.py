@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 STATION_FREQ_HZ = 90_098_000
 TUNE_OFFSET_HZ = 0
-CENTER_FREQ_HZ = STATION_FREQ_HZ + TUNE_OFFSET_HZ
+current_station_freq_hz = STATION_FREQ_HZ
 
 RF_SAMPLE_RATE = 1_024_000
 IF_RATE = 240_000
@@ -290,9 +290,6 @@ class RadioRunner:
         self.audio_buffer = deque()
 
         self.sdr = None
-        self.pending_freq_hz = None
-        self.pending_freq_mhz = None
-        self.tune_lock = threading.Lock()
         self.radio_thread = None
     def get_audio_source(self):
         return DiscordRadioSource(
@@ -357,14 +354,14 @@ class RadioRunner:
     def radio_worker(self):
         try:
             self.send_text_to_discord(
-                f"Tuning to `{STATION_FREQ_HZ / 1_000_000:.3f} MHz`..."
+                f"Tuning to `{current_station_freq_hz / 1_000_000:.3f} MHz`..."
             )
 
             demod_box = [WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)]
 
             self.sdr = RtlSdr()
             self.sdr.sample_rate = RF_SAMPLE_RATE
-            self.sdr.center_freq = CENTER_FREQ_HZ
+            self.sdr.center_freq = current_station_freq_hz + TUNE_OFFSET_HZ
             self.sdr.gain = TUNER_GAIN
 
             if FREQ_PPM:
@@ -387,7 +384,6 @@ class RadioRunner:
                         self.pending_freq_mhz = None
 
                     if requested_freq_hz is not None:
-                        self.sdr.center_freq = requested_freq_hz
 
                         # Reset demodulator state after tuning
                         demod_box[0] = WFMStereoOffset(WFM_CHAN_CUTOFF_HZ_INIT)
@@ -482,7 +478,7 @@ async def radio(ctx):
     radio_runner.start()
 
     await ctx.send(
-        f"Started radio at **{STATION_FREQ_HZ / 1_000_000:.3f} MHz**."
+        f"Started radio at **{current_station_freq_hz / 1_000_000:.3f} MHz**."
     )
 
 
@@ -516,22 +512,42 @@ async def leave(ctx):
 
 @bot.command()
 async def tune(ctx, freq_mhz: float):
-    global radio_runner
-
-    if radio_runner is None:
-        await ctx.send("Radio is not running. Start it first with `!radio`.")
-        return
+    global radio_runner, current_station_freq_hz
 
     if freq_mhz < 50 or freq_mhz > 110:
         await ctx.send("Please enter a normal FM station, like `!tune 101.1`.")
         return
 
-    try:
-        radio_runner.tune(freq_mhz)
-        await ctx.send(f"Tune request sent for **{freq_mhz:.3f} MHz**.")
-    except Exception as e:
-        await ctx.send(f"Could not tune radio: `{e}`")
-        
+    current_station_freq_hz = int(freq_mhz * 1_000_000)
+
+    was_running = radio_runner is not None
+
+    if was_running:
+        await ctx.send(f"Retuning to **{freq_mhz:.3f} MHz**...")
+
+        radio_runner.stop()
+        radio_runner = None
+
+        if ctx.voice_client and ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+
+        await asyncio.sleep(1.0)
+
+        radio_runner = RadioRunner(ctx.channel, bot.loop)
+        source = radio_runner.get_audio_source()
+
+        ctx.voice_client.play(
+            source,
+            after=lambda e: print(f"Discord voice playback error: {e}") if e else None,
+        )
+
+        radio_runner.start()
+
+        await ctx.send(f"Retuned to **{freq_mhz:.3f} MHz**.")
+    else:
+        await ctx.send(
+            f"Station set to **{freq_mhz:.3f} MHz**. Start it with `!radio`."
+        )
 @bot.command()
 async def status(ctx):
     global radio_runner
